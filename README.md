@@ -1031,7 +1031,7 @@ Google 基本必拦。
 | `/who <CA>` | 名单里谁**买过**这个币（查本地库，秒回） |
 | `/ca <CA> [链]` | 查合约：FOMO 上谁在聊这个币、押了多少、赚没赚 |
 | `/chips <CA> [链]` | 筹码分布：FOMO 平台与你的名单各持有多少占比 |
-| `/copy` | 跟单参数（默认**纸上跟单，不花钱**）；`/copy on` 开启 |
+| `/copy` | 跟单参数（默认**纸上跟单，不花钱**）；`/copy on` 开启；`/copy halt` 急停 |
 | `/paper` | 跟单台账：每一单现在赚亏多少 |
 | `/star <handle>` | 特别关注：他的推送带 ⭐、币名加【】 |
 | `/unstar <handle>` | 取消特别关注 |
@@ -1056,6 +1056,30 @@ Google 基本必拦。
 ```
 
 榜单的用处不只是看谁在赚——**没标记的就是「排在前面但你还没盯」的人**，直接 `/add` 即可。
+
+### `/copy` 跟单安全阶梯
+
+默认**全部关闭、只做纸上**。开关互不蕴含，必须按阶梯显式往上爬：
+
+```
+① 纸上(/copy paper，默认)     → 记账、不花钱
+② 演练(/copy real + rehearse) → 走 Playwright 全流程，不点成交
+③ 真实确认(/copy live)        → 真点成交，但仍要你在 TG 点「确认买入」
+④ 无人值守(/copy auto)        → 命中即下单；必须先过 auto_blockers
+```
+
+额外护栏（都不削弱上面的默认）：
+
+| 命令 | 作用 |
+|---|---|
+| `/copy halt` / `/copy resume` | 全局急停 / 恢复；`decide()` 直接跳过，已入队未执行的单也会被拦 |
+| `/copy positions N` | 同时持仓上限（paper/pending/filled/执行中都算；`0`=不限） |
+| `/copy cooldown N` | 真实下单失败或 `halt` 后冷却 N 秒；`0`=不启用 |
+| `/copy spend <美元>` | 当日金额上限（开 `auto` 前**强制**要有） |
+
+发 `/copy`（不带参数）可看到：当前模式、阶梯高亮、急停状态、同时持仓、冷却剩余、以及开无人值守还差哪几步。
+
+> ⚠️ 安全默认值：`enabled=False` · `paper_only=True` · `dry_run_execute=True` · `auto_execute=False` · `halted=False`。升级版本绝不会自己开始花钱。
 
 ### `/hot` 名单买入榜
 

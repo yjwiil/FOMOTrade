@@ -193,6 +193,40 @@ def test_执行前重查配置_停手要拦得住已入队的单(db):
     assert "关闭" in n.sent[0]
 
 
+
+def test_执行前发现急停也要拦得住已入队的单(db):
+    """⚠️ /copy halt 与 /copy off 同级:已入队还没跑的单必须停"""
+    _cfg_auto()
+    _queued()
+    n = _Notif()
+    calls = []
+    w = CopyWorker(n, execute=lambda job, stop=None: calls.append(job) or _Res())
+    with store.get_conn() as c:
+        store.save_copy_config(c, replace(store.load_copy_config(c), halted=True))
+    w.submit(_job())
+    _drain(w)
+    w.close()
+    assert calls == [], "急停之后还去下单 = halt 没用"
+    assert _status()[0] == "failed"
+    assert "急停" in n.sent[0]
+
+
+def test_真实失败后启动冷却(db):
+    _cfg_auto(cooldown_seconds=120)
+    _queued()
+    n = _Notif()
+
+    def boom(job, stop=None):
+        raise RuntimeError("找不到成交按钮")
+
+    w = CopyWorker(n, execute=boom)
+    w.submit(_job(dry_run=False))
+    _drain(w)
+    w.close()
+    with store.get_conn() as c:
+        assert store.copy_cooldown_until(c) is not None
+
+
 def test_队列满了返回False而不是排着等(db):
     """
     ⚠️ submit 跑在轮询 tick 里,阻塞它等于把监控停下来等下单。

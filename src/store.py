@@ -1543,8 +1543,9 @@ _COPY_KEY = "copytrade_config"
 _COPY_NULLABLE = frozenset({"max_age_hours", "max_entry_mcap", "daily_spend_usd"})
 _COPY_TYPES = {
     "enabled": bool, "paper_only": bool, "dry_run_execute": bool, "auto_execute": bool,
-    "starred_only": bool,
+    "halted": bool, "starred_only": bool,
     "min_buyers": int, "window_hours": int, "daily_max": int, "max_age_hours": int,
+    "max_open_positions": int, "cooldown_seconds": int,
     "amount_usd": float, "max_entry_mcap": float, "daily_spend_usd": float,
     "networks": tuple,
 }
@@ -1676,6 +1677,82 @@ def copy_spent_today(conn) -> float:
         (now_iso()[:10] + "T00:00:00+00:00", *SPENDING_STATUSES),
     ).fetchone()
     return float(row["s"] or 0.0)
+
+
+
+# 「还算开着」的仓位状态 —— 同时持仓上限的分子。
+# ⚠️ rejected/failed/expired 明确不占位:忽略、失败、过期都不该挡住下一单。
+# ⚠️ paper 也算:纸上跟单的意义就是占一个名额练手,不限等于纸上也能无限开仓。
+# ⚠️ unknown 也算:钱可能已经出去,不确定时按占着算(与金额上限同口径)。
+OPEN_POSITION_STATUSES = ("paper", "pending", "executing", "auto_queued", "auto_executing",
+                          "filled", "unknown")
+
+_COPY_COOLDOWN_KEY = "copytrade_cooldown_until"
+
+
+def copy_open_positions(conn) -> int:
+    """现在还开着几单 —— 同时持仓上限的分子(跨日累计,不只看今天)"""
+    marks = ",".join("?" * len(OPEN_POSITION_STATUSES))
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS n FROM copytrade_signals
+        WHERE status IN ({marks})
+        """,  # noqa: S608
+        OPEN_POSITION_STATUSES,
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def copy_cooldown_until(conn) -> float | None:
+    """
+    冷却结束的 unix 秒;None = 没在冷却 / 已过期。
+
+    ⚠️ 读坏了必须退回 None(不拦):冷却本身是附加护栏,读失败不该变成"永远不能跟"。
+    """
+    try:
+        raw = get_state(conn, _COPY_COOLDOWN_KEY)
+        if not raw:
+            return None
+        until = float(raw)
+        if until <= time.time():
+            return None
+        return until
+    except Exception as e:  # noqa: BLE001
+        logger.warning("跟单冷却读取失败,按未冷却处理: {}", e)
+        return None
+
+
+def arm_copy_cooldown(conn, seconds: int) -> float | None:
+    """
+    把冷却终点设到 now+seconds。seconds<=0 时什么都不做。
+    返回新的终点(unix 秒),或 None 表示没启用。
+
+    ⚠️ 只往后推、不往前缩:连续失败时以**最晚**那次为准,
+       否则第一次失败设的冷却会被紧接着的第二次"刷新成更短"。
+       (实际两次失败间隔通常 > 冷却,这条主要防测试/重入。)
+    """
+    if seconds <= 0:
+        return None
+    until = time.time() + seconds
+    try:
+        cur = copy_cooldown_until(conn)
+        if cur is not None and cur > until:
+            return cur
+        with tx(conn):
+            set_state(conn, _COPY_COOLDOWN_KEY, str(until))
+        return until
+    except Exception as e:  # noqa: BLE001
+        logger.warning("跟单冷却写入失败: {}", e)
+        return None
+
+
+def clear_copy_cooldown(conn) -> None:
+    """清掉冷却终点。/copy resume 时可选调用;失败不抛。"""
+    try:
+        with tx(conn):
+            set_state(conn, _COPY_COOLDOWN_KEY, "")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("跟单冷却清除失败: {}", e)
 
 
 def record_copy_signal(conn, *, network_id: str, token_address: str, token_symbol: str | None,

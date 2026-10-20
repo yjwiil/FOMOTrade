@@ -618,6 +618,9 @@ class CommandBot:
             #    能把另一条路径写好的 filled 盖掉 —— 钱花了、台账写"未成交"。
             with store.get_conn() as conn:
                 store.set_copy_status(conn, net, ca, "failed", str(e)[:200], expect="executing")
+                # 真实下单失败才进冷却;演练失败不该锁住后续纸面验证。
+                if not cfg.dry_run_execute and cfg.cooldown_seconds > 0:
+                    store.arm_copy_cooldown(conn, cfg.cooldown_seconds)
             return (f"没有成交:{e}"[:180],
                     f"❌ <b>未成交</b> · ${_esc(sym)}\n{_esc(str(e)[:300])}\n"
                     f"<code>{_esc(ca)}</code>")
@@ -1133,8 +1136,14 @@ class CommandBot:
         "auto":    ("auto_execute", lambda v: True),
         "manual":  ("auto_execute", lambda v: False),
         "starred": ("starred_only", lambda v: v in ("1", "on", "true", "yes")),
+        # 急停 / 同时持仓 / 冷却 —— 见 copytrade.CopyConfig 注释
+        "halt":    ("halted", lambda v: True),
+        "resume":  ("halted", lambda v: False),
+        "positions": ("max_open_positions", lambda v: max(0, int(v))),
+        "cooldown": ("cooldown_seconds", lambda v: max(0, int(v))),
     }
-    _COPY_SWITCHES = ("on", "off", "paper", "real", "live", "rehearse", "auto", "manual")
+    _COPY_SWITCHES = ("on", "off", "paper", "real", "live", "rehearse", "auto", "manual",
+                      "halt", "resume")
 
     def _cmd_copy(self, arg: str) -> str:
         """/copy 查看 · /copy <项> <值> 改。⚠️ 接真实下单必须显式 /copy real"""
@@ -1145,9 +1154,10 @@ class CommandBot:
                 key = parts[0].strip().lower()
                 spec = self._COPY_FIELDS.get(key)
                 if not spec:
-                    return ("❓ 可改:on/off · paper/real · rehearse/live · manual/auto"
-                            " · buyers · window · age · mcap · amount · daily · spend · starred\n"
-                            "例:<code>/copy buyers 2</code>")
+                    return ("❓ 可改:on/off · halt/resume · paper/real · rehearse/live · manual/auto"
+                            " · buyers · window · age · mcap · amount · daily · spend"
+                            " · positions · cooldown · starred\n"
+                            "例:<code>/copy buyers 2</code> · <code>/copy halt</code>")
                 field, parse = spec
                 raw = parts[1].strip().lower() if len(parts) > 1 else ""
                 if key not in self._COPY_SWITCHES and not raw:
@@ -1164,8 +1174,14 @@ class CommandBot:
                             + "\n".join(f"· {_esc(b)}" for b in blockers))
                 cfg = new_cfg
                 store.save_copy_config(conn, cfg)
+                # ⚠️ halt 顺带启动冷却(若配了 cooldown_seconds):急停解除后也不该立刻再跟,
+                #    否则"停一下又马上自动买"等于没停。resume 只解除 halted,冷却自然到期。
+                if key == "halt" and cfg.cooldown_seconds > 0:
+                    store.arm_copy_cooldown(conn, cfg.cooldown_seconds)
             taken = store.copy_taken_today(conn)
             spent = store.copy_spent_today(conn)
+            open_n = store.copy_open_positions(conn)
+            cool_until = store.copy_cooldown_until(conn)
 
         # ⚠️ 模式按"实际会发生什么"算,不是按开关名字堆:
         #    paper 盖过一切,dry_run 盖过 auto —— 开了 auto 但还在演练时,
@@ -1179,6 +1195,13 @@ class CommandBot:
             mode = "🤖 <b>无人值守自动成交</b>(没有人会被问)"
         else:
             mode = "🛒 <b>真实成交</b>(仍需你点确认)"
+        # 安全阶梯:纸上 → 真实(演练) → 真实成交 → 无人值守。当前所在那一格加粗。
+        ladder = (
+            f"{'<b>①纸上</b>' if cfg.paper_only else '①纸上'}"
+            f" → {'<b>②演练</b>' if (not cfg.paper_only and cfg.dry_run_execute) else '②演练'}"
+            f" → {'<b>③真实确认</b>' if (not cfg.paper_only and not cfg.dry_run_execute and not cfg.auto_execute) else '③真实确认'}"
+            f" → {'<b>④无人值守</b>' if (not cfg.paper_only and not cfg.dry_run_execute and cfg.auto_execute) else '④无人值守'}"
+        )
         age = f"≤ {cfg.max_age_hours} 小时" if cfg.max_age_hours is not None else "不限"
         mcap = _money(cfg.max_entry_mcap) if cfg.max_entry_mcap is not None else "不限"
         # ⚠️ daily_max=0 是「不限」(与 age/mcap 的 off 同义)。渲染成 "今日 3/0 单"
@@ -1186,14 +1209,36 @@ class CommandBot:
         cnt = f"{taken}/{cfg.daily_max} 单" if cfg.daily_max > 0 else f"{taken} 单(笔数不限)"
         spend = (f"{_money(spent)}/{_money(cfg.daily_spend_usd)}"
                  if cfg.daily_spend_usd is not None else f"{_money(spent)}(金额不限)")
+        pos = (f"{open_n}/{cfg.max_open_positions}"
+               if cfg.max_open_positions > 0 else f"{open_n}(不限)")
+        if cfg.halted:
+            halt_line = "🛑 <b>急停中</b> · <code>/copy resume</code> 恢复"
+        else:
+            halt_line = "🛑 急停:关 · <code>/copy halt</code> 立刻停手"
+        if cool_until is not None:
+            left = max(0, int(cool_until - time.time()))
+            cool_line = f"❄️ 冷却中还剩 <b>{left}s</b>(失败/急停后冷却 {cfg.cooldown_seconds}s)"
+        elif cfg.cooldown_seconds > 0:
+            cool_line = f"❄️ 冷却:{cfg.cooldown_seconds}s(失败或 halt 后生效)"
+        else:
+            cool_line = "❄️ 冷却:未启用 · <code>/copy cooldown 60</code>"
+        blockers = auto_blockers(cfg)
+        if blockers:
+            block_line = "🚧 开无人值守还差:\n" + "\n".join(f"· {_esc(b)}" for b in blockers)
+        else:
+            block_line = "🚧 开无人值守:条件已齐 · <code>/copy auto</code>"
         return "\n".join([
             f"🤖 <b>跟单</b> · {'✅ 已开启' if cfg.enabled else '⛔ 未开启'} · {mode}",
+            f"🪜 阶梯 {ladder}",
+            halt_line,
             f"👥 触发人数 ≥ <b>{cfg.min_buyers}</b>(窗口 {cfg.window_hours}h)"
             + ("· 只数 ⭐" if cfg.starred_only else ""),
             f"🕐 币龄 {age} · 💎 入场市值 {mcap}",
             f"💰 每单 {_money(cfg.amount_usd)} · 📅 今日 {cnt} · 💸 今日 {spend}",
+            f"📦 同时持仓 {pos} · {cool_line}",
+            block_line,
             "同一个币只跟一次 · 改:<code>/copy buyers 2</code> "
-            "<code>/copy age 24</code> <code>/copy amount 50</code>",
+            "<code>/copy positions 5</code> · <code>/copy halt</code>",
         ])
 
     def _cmd_paper(self) -> str:

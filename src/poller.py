@@ -2462,9 +2462,14 @@ class Poller:
                     first_ts[k] = e.event_ts
         ordered = sorted(keys, key=lambda k: (-buyers[k], first_ts.get(k, ""), k))
 
-        # ⚠️ 两个上限的分子。查一次、循环内自增 —— 每个币都重查一遍库不但浪费,
+        # ⚠️ 上限的分子。查一次、循环内自增 —— 每个币都重查一遍库不但浪费,
         #    也挡不住同一轮内的累计(record 是逐个提交的,重查反而看起来"对")。
-        used = {"n": store.copy_taken_today(conn), "usd": store.copy_spent_today(conn)}
+        used = {
+            "n": store.copy_taken_today(conn),
+            "usd": store.copy_spent_today(conn),
+            "open": store.copy_open_positions(conn),
+        }
+        cooldown_until = store.copy_cooldown_until(conn)
         for net, ca in ordered:
             # ⚠️ 每个币独立兜底。循环体里马上要接真实下单,而执行器有十几处 raise
             #    (profile 被占、会话过期、页面改版、报价超时 —— 全是常态)。
@@ -2472,17 +2477,19 @@ class Poller:
             #    而外层那句"跟单信号判定失败(不影响推送)"会把它伪装成无害。
             try:
                 self._copy_one(conn, net, ca, cfg, since, used,
-                               ev_mcap.get((net, ca)), buyers[(net, ca)], dry_run=dry_run)
+                               ev_mcap.get((net, ca)), buyers[(net, ca)],
+                               cooldown_until=cooldown_until, dry_run=dry_run)
             except Exception as e:  # noqa: BLE001
                 logger.exception("跟单单币处理失败,跳过这个币继续 | {} {} | {}", net, ca[:10], e)
 
     def _copy_one(self, conn, net: str, ca: str, cfg, since: str, used: dict,
-                  event_mcap: float | None, buyers: int, *, dry_run: bool) -> None:
+                  event_mcap: float | None, buyers: int, *,
+                  cooldown_until: float | None = None, dry_run: bool) -> None:
         """
         判定并记账**一个**币。异常由调用方按币兜底,见 _check_copytrade。
 
-        used 是本轮共享的当日用量 {n: 笔数, usd: 金额},命中后就地自增 ——
-        ⚠️ 不自增的话,一个 tick 里命中 15 个币会 15 单全过,当日上限形同虚设。
+        used 是本轮共享的用量 {n: 今日笔数, usd: 今日金额, open: 同时持仓},命中后就地自增 ——
+        ⚠️ 不自增的话,一个 tick 里命中 15 个币会 15 单全过,当日/持仓上限形同虚设。
         """
         meta = self._token_meta.get((net, ca)) or {}
         # 入场市值按**新鲜度**取,不是按哪张表方便:
@@ -2508,6 +2515,8 @@ class Poller:
             already_taken=False,     # 由 record_copy_signal 的主键冲突兜底,见下
             taken_today=used["n"],
             spent_today=used["usd"],
+            open_positions=used["open"],
+            cooldown_until=cooldown_until,
         )
         d = decide(cand, cfg)
         if not d.take:
@@ -2533,6 +2542,8 @@ class Poller:
         used["n"] += 1
         if status in store.SPENDING_STATUSES:
             used["usd"] += cfg.amount_usd
+        if status in store.OPEN_POSITION_STATUSES:
+            used["open"] += 1
         logger.info("跟单信号 | {} · {} 人买过 · 入场市值 {} · {}",
                     cand.token_symbol, cand.buyers, cand.entry_mcap, status)
         if dry_run:

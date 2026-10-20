@@ -69,6 +69,18 @@ class CopyConfig:
     #    daily_max 只数**笔数**,而笔数 × 单笔金额才是钱。改了 amount_usd 忘了改
     #    daily_max,当天敞口就是静默翻倍。所以 auto_execute 强制要求这一项有值。
     daily_spend_usd: float | None = None
+    # ⚠️ 全局急停。与 enabled 不同:enabled 是"功能开没开",halted 是"临时停手"。
+    #    /copy halt 之后 decide() 一律跳过;/copy resume 才恢复。
+    #    默认 False —— 绝不能因为升级一版就自己急停(那会让纸上验证也静默停摆)。
+    halted: bool = False
+    # 同时最多占着几单"还算开着"的仓(paper/pending/filled/执行中…)。0 = 不限。
+    # ⚠️ 与 daily_max 不同:那个按**今天触发了几单**数,这个按**现在还开着几单**数 ——
+    #    昨天的 filled 仍然占位,直到它不再算开仓(rejected/failed/expired)。
+    max_open_positions: int = 0
+    # 真实下单失败、或 /copy halt 之后,冷却多少秒才允许再跟。0 = 不启用。
+    # ⚠️ 冷却终点存在 runtime_state 里(见 store.copy_cooldown_until),不写进本配置 ——
+    #    配置是用户旋钮,冷却终点是运行时事实;混在一起会让 /copy 改参数时把终点冲掉。
+    cooldown_seconds: int = 0
     networks: tuple[str, ...] = ()      # 链白名单;空 = 不限
     starred_only: bool = False          # 只数 ⭐ 特别关注的人
 
@@ -85,6 +97,9 @@ SKIP_NO_MCAP = "拿不到入场市值"
 SKIP_NETWORK = "链不在白名单"
 SKIP_DAILY = "已达当日上限"
 SKIP_DAILY_SPEND = "已达当日金额上限"
+SKIP_HALTED = "已急停"
+SKIP_MAX_OPEN = "已达同时持仓上限"
+SKIP_COOLDOWN = "冷却中"
 TAKE = "命中"
 
 
@@ -99,6 +114,8 @@ def auto_blockers(cfg: CopyConfig) -> list[str]:
     out = []
     if not cfg.enabled:
         out.append("跟单本身没开(/copy on)")
+    if cfg.halted:
+        out.append("正处于急停(/copy resume)")
     if cfg.paper_only:
         out.append("还在纸上跟单(/copy real)")
     if cfg.dry_run_execute:
@@ -129,6 +146,10 @@ class Candidate:
     # 今天已经花掉多少美元。⚠️ 只统计**真的会出账**的那些状态,
     #    别把演练/已忽略/失败的也算进来 —— 口径不一致会让上限提前封死。
     spent_today: float = 0.0
+    # 现在还开着几单(paper/pending/filled/执行中…)。由 store.copy_open_positions 提供。
+    open_positions: int = 0
+    # 冷却结束的 unix 秒;None = 没在冷却。由 store.copy_cooldown_until 提供。
+    cooldown_until: float | None = None
 
 
 @dataclass(frozen=True)
@@ -152,6 +173,13 @@ def decide(c: Candidate, cfg: CopyConfig, now: float | None = None) -> Decision:
 
     if not cfg.enabled:
         return Decision(False, SKIP_DISABLED)
+    # ⚠️ 急停紧跟"未启用":它是"根本轮不到它",不是"这个币不合格"。
+    #    放后面的话,急停期间所有币的原因都会变成别的,看不出是人按了 halt。
+    if cfg.halted:
+        return Decision(False, SKIP_HALTED)
+    # 冷却同理:失败/急停之后的冷静期,先于币本身的门槛。
+    if c.cooldown_until is not None and now < c.cooldown_until:
+        return Decision(False, SKIP_COOLDOWN)
     if c.already_taken:
         return Decision(False, SKIP_ALREADY)
     if c.buyers < cfg.min_buyers:
@@ -184,6 +212,11 @@ def decide(c: Candidate, cfg: CopyConfig, now: float | None = None) -> Decision:
     #    看不出哪些币其实本来也不符合条件。
     if cfg.daily_max > 0 and c.taken_today >= cfg.daily_max:
         return Decision(False, SKIP_DAILY, age)
+
+    # ⚠️ 同时持仓上限放在笔数上限旁边:它也是"容量满了"而不是"这个币不合格"。
+    #    0 = 不限(与 daily_max 同义)。
+    if cfg.max_open_positions > 0 and c.open_positions >= cfg.max_open_positions:
+        return Decision(False, SKIP_MAX_OPEN, age)
 
     # ⚠️ 金额上限判"这一单下完会不会超",不是"现在超没超" ——
     #    后者会让最后一单把上限捅穿(上限 $100、已花 $99、单笔 $40 → 放行到 $139)。
