@@ -149,9 +149,11 @@ class CopyWorker:
         #    /copy off 要能拦住**还没开始跑**的单,否则"停手"只对未来生效。
         with store.get_conn() as conn:
             cfg = store.load_copy_config(conn)
-            if not (cfg.enabled and cfg.auto_execute and not cfg.paper_only):
-                self._finish(job, "failed", "执行前发现跟单已被关闭,未下单",
-                             emoji="🛑", title="已取消")
+            # ⚠️ halted 与 enabled 同级:急停必须拦住**已经入队、还没开始跑**的单。
+            if cfg.halted or not (cfg.enabled and cfg.auto_execute and not cfg.paper_only):
+                why = ("执行前发现已急停,未下单" if cfg.halted
+                       else "执行前发现跟单已被关闭,未下单")
+                self._finish(job, "failed", why, emoji="🛑", title="已取消")
                 return
             # ---- 抢占:只有从 auto_queued 抢到的才有权执行 ----
             if not store.set_copy_status(conn, net, ca, ST_EXECUTING, expect=ST_QUEUED):
@@ -167,6 +169,15 @@ class CopyWorker:
         except Exception as e:  # noqa: BLE001
             logger.exception("自动买入失败 | {} {}", job.symbol, ca[:10])
             self._finish(job, "failed", str(e)[:300], emoji="❌", title="未成交")
+            # 真实下单失败才进冷却;演练失败不该锁住后续验证。
+            if not job.dry_run:
+                try:
+                    with store.get_conn() as conn:
+                        cfg = store.load_copy_config(conn)
+                        if cfg.cooldown_seconds > 0:
+                            store.arm_copy_cooldown(conn, cfg.cooldown_seconds)
+                except Exception as e2:  # noqa: BLE001
+                    logger.warning("失败后启动冷却失败: {}", e2)
             return
 
         # ⚠️ 演练模式绝不能记 filled:那会让 /paper 给一个并不存在的仓位算盈亏
@@ -198,7 +209,8 @@ class CopyWorker:
         try:
             with store.get_conn() as conn:
                 cfg = store.load_copy_config(conn)
-            return not (cfg.enabled and cfg.auto_execute and not cfg.paper_only)
+            # halted 也算停手:点成交之前还能被 /copy halt 拦住
+            return cfg.halted or not (cfg.enabled and cfg.auto_execute and not cfg.paper_only)
         except Exception as e:  # noqa: BLE001
             logger.warning("急停判断查库失败,按继续处理: {}", e)
             return False

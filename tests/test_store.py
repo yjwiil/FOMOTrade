@@ -1502,6 +1502,29 @@ def test_金额上限只数真的会出账的状态(conn):
     assert store.copy_taken_today(conn) == 5, "笔数口径含全部,与金额口径故意不同"
 
 
+
+def test_copy_open_positions只数还开着的仓(tmp_path, monkeypatch):
+    """rejected/failed/expired 不占同时持仓名额;paper/filled/pending 占"""
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "open.db")
+    store.init_db()
+    with store.get_conn() as conn:
+        for i, st_ in enumerate(("paper", "filled", "pending", "rejected", "failed", "expired")):
+            store.record_copy_signal(
+                conn, network_id="solana", token_address=f"ca{i}", token_symbol="X",
+                buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status=st_)
+        assert store.copy_open_positions(conn) == 3
+
+
+def test_arm_copy_cooldown只往后推(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "DB_PATH", tmp_path / "cool.db")
+    store.init_db()
+    with store.get_conn() as conn:
+        a = store.arm_copy_cooldown(conn, 100)
+        assert a is not None
+        b = store.arm_copy_cooldown(conn, 10)  # 更短,不应覆盖
+        assert b == a
+        assert store.copy_cooldown_until(conn) is not None
+
 def test_名单盈亏快照按人覆盖写(conn):
     """同一个人只保留最新一条,不是每次都追加 —— 否则一天就是几百行垃圾"""
     store.save_user_pnl(conn, [

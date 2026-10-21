@@ -15,9 +15,12 @@ import pytest
 
 from src.copytrade import (
     SKIP_ALREADY,
+    SKIP_COOLDOWN,
     SKIP_DAILY,
     SKIP_DAILY_SPEND,
     SKIP_DISABLED,
+    SKIP_HALTED,
+    SKIP_MAX_OPEN,
     SKIP_MCAP,
     SKIP_NETWORK,
     SKIP_NO_AGE,
@@ -60,6 +63,53 @@ def test_默认不启用():
     assert CopyConfig().paper_only is True, "默认必须是纸上跟单"
     assert CopyConfig().auto_execute is False, "无人值守默认必须是关的"
     assert decide(_cand(), CopyConfig(), now=NOW).reason == SKIP_DISABLED
+
+    assert CopyConfig().halted is False, "默认绝不能自己急停"
+    assert CopyConfig().max_open_positions == 0, "0 = 不限"
+    assert CopyConfig().cooldown_seconds == 0, "0 = 不启用冷却"
+
+
+# ============================================================
+# 急停 / 同时持仓 / 冷却
+# ============================================================
+def test_急停时一律不跟():
+    """⚠️ /copy halt 必须让 decide 立刻停手,不能只靠 worker 那一层"""
+    d = decide(_cand(), _cfg(halted=True), now=NOW)
+    assert not d.take and d.reason == SKIP_HALTED
+
+
+def test_急停排在币本身门槛之前():
+    """急停期间原因必须是急停,而不是碰巧先命中的人数不够"""
+    bad = _cand(buyers=0)
+    assert decide(bad, _cfg(halted=True, min_buyers=3), now=NOW).reason == SKIP_HALTED
+
+
+def test_同时持仓上限():
+    cfg = _cfg(max_open_positions=3)
+    assert decide(_cand(open_positions=2), cfg, now=NOW).take
+    d = decide(_cand(open_positions=3), cfg, now=NOW)
+    assert not d.take and d.reason == SKIP_MAX_OPEN
+    assert decide(_cand(open_positions=99), _cfg(max_open_positions=0), now=NOW).take, "0 = 不限"
+
+
+def test_同时持仓上限排在不合格币之后():
+    """容量满了之后,仍应先报出币本身不合格的原因"""
+    bad = _cand(buyers=1, open_positions=99)
+    assert decide(bad, _cfg(min_buyers=3, max_open_positions=5), now=NOW).reason == SKIP_NOT_ENOUGH
+
+
+def test_冷却期内不跟():
+    cfg = _cfg(cooldown_seconds=60)
+    d = decide(_cand(cooldown_until=NOW + 30), cfg, now=NOW)
+    assert not d.take and d.reason == SKIP_COOLDOWN
+    assert decide(_cand(cooldown_until=NOW - 1), cfg, now=NOW).take, "已过期应放行"
+    assert decide(_cand(cooldown_until=None), cfg, now=NOW).take, "没在冷却应放行"
+
+
+def test_急停也是开自动的blocker():
+    cfg = _cfg(paper_only=False, dry_run_execute=False, amount_usd=40.0,
+               daily_spend_usd=200.0, halted=True)
+    assert any("急停" in b for b in auto_blockers(cfg))
 
 
 # ============================================================
@@ -553,6 +603,59 @@ def test_行情够新时不要占屏(monkeypatch, tmp_path):
             buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status="filled")
         store_.upsert_token_snapshots(c, [("solana", "ca1", "X", 1.0, 5000.0)])
     assert "行情停在" not in b._cmd_paper()
+
+
+def test_copy_halt与resume(monkeypatch, tmp_path):
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    out = b._cmd_copy("halt")
+    assert "急停" in out
+    with store_.get_conn() as c:
+        assert store_.load_copy_config(c).halted is True
+    out = b._cmd_copy("resume")
+    assert "急停" in out or "已开启" in out or "未开启" in out
+    with store_.get_conn() as c:
+        assert store_.load_copy_config(c).halted is False
+
+
+def test_copy_halt会启动冷却(monkeypatch, tmp_path):
+    from dataclasses import replace as _replace
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    with store_.get_conn() as c:
+        store_.save_copy_config(c, _replace(store_.load_copy_config(c), cooldown_seconds=90))
+    b._cmd_copy("halt")
+    with store_.get_conn() as c:
+        until = store_.copy_cooldown_until(c)
+        assert until is not None and until > time.time()
+
+
+def test_copy状态展示阶梯与急停与持仓(monkeypatch, tmp_path):
+    from dataclasses import replace as _replace
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    with store_.get_conn() as c:
+        store_.save_copy_config(c, _replace(
+            store_.load_copy_config(c), enabled=True, max_open_positions=5,
+            cooldown_seconds=30))
+        store_.record_copy_signal(
+            c, network_id="solana", token_address="ca1", token_symbol="X",
+            buyers=2, entry_mcap=1000.0, age_sec=60, amount_usd=40.0, status="paper")
+    out = b._cmd_copy("")
+    assert "阶梯" in out
+    assert "急停" in out
+    assert "同时持仓" in out
+    assert "还差" in out or "条件已齐" in out
+    assert "①纸上" in out
+
+
+def test_copy_positions可改(monkeypatch, tmp_path):
+    n = _Notif()
+    b, store_ = _bot(monkeypatch, tmp_path, n)
+    out = b._cmd_copy("positions 3")
+    assert "同时持仓" in out
+    with store_.get_conn() as c:
+        assert store_.load_copy_config(c).max_open_positions == 3
 
 
 # ============================================================
